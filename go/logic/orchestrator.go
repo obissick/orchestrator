@@ -45,6 +45,7 @@ var discoveryQueue *discovery.Queue
 
 var discoveriesCounter = metrics.NewCounter()
 var failedDiscoveriesCounter = metrics.NewCounter()
+var instancePollSecondsExceededCounter = metrics.NewCounter()
 var discoveryQueueLengthGauge = metrics.NewGauge()
 var discoveryRecentCountGauge = metrics.NewGauge()
 var isElectedGauge = metrics.NewGauge()
@@ -57,6 +58,7 @@ var recentDiscoveryOperationKeys *cache.Cache
 func init() {
 	metrics.Register("discoveries.attempt", discoveriesCounter)
 	metrics.Register("discoveries.fail", failedDiscoveriesCounter)
+	metrics.Register("discoveries.instance_poll_seconds_exceeded", instancePollSecondsExceededCounter)
 	metrics.Register("discoveries.queue_length", discoveryQueueLengthGauge)
 	metrics.Register("discoveries.recent_count", discoveryRecentCountGauge)
 	metrics.Register("elect.is_elected", isElectedGauge)
@@ -69,6 +71,11 @@ func init() {
 		discoveryRecentCountGauge.Update(int64(recentDiscoveryOperationKeys.ItemCount()))
 	})
 	ometrics.OnGraphiteTick(func() { isElectedGauge.Update(int64(atomic.LoadInt64(&isElectedNode))) })
+}
+
+// used in several places
+func instancePollSecondsDuration() time.Duration {
+	return time.Duration(config.Config.InstancePollSeconds) * time.Second
 }
 
 // acceptSignals registers for OS signals
@@ -140,8 +147,9 @@ func discoverInstance(instanceKey inst.InstanceKey) {
 	defer func() {
 		latency.Stop("total")
 		discoveryTime := latency.Elapsed("total")
-		if discoveryTime > time.Duration(config.Config.InstancePollSeconds)*time.Second {
-			log.Warningf("discoverInstance for key %v took %.4fs", instanceKey, discoveryTime.Seconds())
+		if discoveryTime > instancePollSecondsDuration() {
+			instancePollSecondsExceededCounter.Inc(1)
+			log.Warningf("discoverInstance exceeded InstancePollSeconds for %+v, took %.4fs", instanceKey, discoveryTime.Seconds())
 		}
 	}()
 
@@ -150,7 +158,10 @@ func discoverInstance(instanceKey inst.InstanceKey) {
 		return
 	}
 
-	if existsInCacheError := recentDiscoveryOperationKeys.Add(instanceKey.DisplayString(), true, cache.DefaultExpiration); existsInCacheError != nil {
+	// Calculate the expiry period each time as InstancePollSeconds
+	// _may_ change during the run of the process (via SIGHUP) and
+	// it is not possible to change the cache's default expiry..
+	if existsInCacheError := recentDiscoveryOperationKeys.Add(instanceKey.DisplayString(), true, instancePollSecondsDuration()); existsInCacheError != nil {
 		// Just recently attempted
 		return
 	}
@@ -216,7 +227,13 @@ func discoverInstance(instanceKey inst.InstanceKey) {
 
 	// Investigate replicas:
 	for _, replicaKey := range instance.SlaveHosts.GetInstanceKeys() {
-		replicaKey := replicaKey
+		replicaKey := replicaKey // not needed? no concurrency here?
+
+		// Avoid noticing some hosts we would otherwise discover
+		if inst.RegexpMatchPatterns(replicaKey.Hostname, config.Config.DiscoveryIgnoreReplicaHostnameFilters) {
+			continue
+		}
+
 		if replicaKey.IsValid() {
 			discoveryQueue.Push(replicaKey)
 		}
@@ -242,9 +259,9 @@ func onDiscoveryTick() {
 
 	if !myIsElectedNode {
 		if electedNode, _, err := process.ElectedNode(); err == nil {
-			log.Debugf("Not elected as active node; active node: %v; polling", electedNode.Hostname)
+			log.Infof("Not elected as active node; active node: %v; polling", electedNode.Hostname)
 		} else {
-			log.Debugf("Not elected as active node; active node: Unable to determine: %v; polling", err)
+			log.Infof("Not elected as active node; active node: Unable to determine: %v; polling", err)
 		}
 		return
 	}
@@ -281,18 +298,14 @@ func onDiscoveryTick() {
 // periodically investigated and their status captured, and long since unseen instances are
 // purged and forgotten.
 func ContinuousDiscovery() {
-	if config.Config.DatabaselessMode__experimental {
-		log.Fatal("Cannot execute continuous mode in databaseless mode")
-	}
-
 	log.Infof("Starting continuous discovery")
-	recentDiscoveryOperationKeys = cache.New(time.Duration(config.Config.InstancePollSeconds)*time.Second, time.Second)
+	recentDiscoveryOperationKeys = cache.New(instancePollSecondsDuration(), time.Second)
 
 	inst.LoadHostnameResolveCache()
 	go handleDiscoveryRequests()
 
-	discoveryTick := time.Tick(time.Duration(config.Config.GetDiscoveryPollSeconds()) * time.Second)
-	instancePollTick := time.Tick(time.Duration(config.Config.InstancePollSeconds) * time.Second)
+	discoveryTick := time.Tick(config.DiscoveryPollSeconds * time.Second)
+	instancePollTick := time.Tick(instancePollSecondsDuration())
 	caretakingTick := time.Tick(time.Minute)
 	recoveryTick := time.Tick(time.Duration(config.Config.RecoveryPollSeconds) * time.Second)
 	var snapshotTopologiesTick <-chan time.Time
@@ -319,6 +332,8 @@ func ContinuousDiscovery() {
 				// as instance poll
 				if atomic.LoadInt64(&isElectedNode) == 1 {
 					go inst.RecordInstanceCoordinatesHistory()
+					go inst.UpdateClusterAliases()
+					go inst.ExpireDowntime()
 				}
 			}()
 		case <-caretakingTick:
@@ -333,9 +348,7 @@ func ContinuousDiscovery() {
 					go inst.ReviewUnseenInstances()
 					go inst.InjectUnseenMasters()
 					go inst.ResolveUnknownMasterHostnameResolves()
-					go inst.UpdateClusterAliases()
 					go inst.ExpireMaintenance()
-					go inst.ExpireDowntime()
 					go inst.ExpireCandidateInstances()
 					go inst.ExpireHostnameUnresolve()
 					go inst.ExpireClusterDomainName()
@@ -394,7 +407,7 @@ func ContinuousAgentsPoll() {
 
 	go discoverSeededAgents()
 
-	tick := time.Tick(time.Duration(config.Config.GetDiscoveryPollSeconds()) * time.Second)
+	tick := time.Tick(config.DiscoveryPollSeconds * time.Second)
 	caretakingTick := time.Tick(time.Hour)
 	for range tick {
 		agentsHosts, _ := agent.ReadOutdatedAgentsHosts()

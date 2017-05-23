@@ -330,7 +330,11 @@ function openNodeModal(node) {
 
   addNodeModalDataAttribute("Has binary logs", booleanString(node.LogBinEnabled));
   if (node.LogBinEnabled) {
-    addNodeModalDataAttribute("Binlog format", node.Binlog_format);
+    var format = node.Binlog_format;
+    if (format == 'ROW' && node.BinlogRowImage != '') {
+      format = format + "/" + node.BinlogRowImage;
+    }
+    addNodeModalDataAttribute("Binlog format", format);
     var td = addNodeModalDataAttribute("Logs slave updates", booleanString(node.LogSlaveUpdatesEnabled));
     $('#node_modal button[data-btn=take-siblings]').appendTo(td.find("div"))
   }
@@ -567,7 +571,7 @@ function normalizeInstance(instance) {
   instance.replicationAttemptingToRun = instance.Slave_SQL_Running || instance.Slave_IO_Running;
   instance.replicationLagReasonable = Math.abs(instance.SlaveLagSeconds.Int64 - instance.SQLDelay) <= 10;
   instance.isSeenRecently = instance.SecondsSinceLastSeen.Valid && instance.SecondsSinceLastSeen.Int64 <= 3600;
-  instance.usingGTID = instance.UsingOracleGTID || instance.UsingMariaDBGTID;
+  instance.usingGTID = instance.UsingOracleGTID || instance.SupportsOracleGTID || instance.UsingMariaDBGTID;
   instance.isMaxScale = (instance.Version.indexOf("maxscale") >= 0);
 
   // used by cluster-tree
@@ -811,6 +815,9 @@ function renderInstanceElement(popoverElement, instance, renderType) {
     if (instance.IsCandidate) {
       popoverElement.find("h3 div.pull-right").prepend('<span class="glyphicon glyphicon-heart" title="Candidate"></span> ');
     }
+    if (instance.PromotionRule == "must_not") {
+      popoverElement.find("h3 div.pull-right").prepend('<span class="glyphicon glyphicon-ban-circle" title="Must not promote"></span> ');
+    }
     if (instance.inMaintenanceProblem()) {
       popoverElement.find("h3 div.pull-right").prepend('<span class="glyphicon glyphicon-wrench" title="In maintenance"></span> ');
     }
@@ -849,7 +856,11 @@ function renderInstanceElement(popoverElement, instance, renderType) {
       identityHtml += instance.Version;
     }
     if (instance.LogBinEnabled) {
-      identityHtml += " " + instance.Binlog_format;
+      var format = instance.Binlog_format;
+      if (format == 'ROW' && instance.BinlogRowImage != '') {
+        format = format + "/" + instance.BinlogRowImage.substring(0,1);
+      }
+      identityHtml += " " + format;
     }
     if (!isAnonymized()) {
       identityHtml += ', ' + instance.FlavorName;
